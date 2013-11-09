@@ -1,0 +1,75 @@
+** Please note that since we're assuming a window of size 1, a lot of my desing choices
+were chosen accordingly, and I will need to modify some of those choices for lab 3. 
+ 
+rel_t:
+
+rel_t keeps track of 
+1) the last sent packet, 
+2) the last acked packet, 
+3) the last received packet (all three by keeping track of the corresponding sequence numbers),
+4) a copy of the last received packet (in case we're buffering it),
+5) the last time we (re)transmitted a data packet, and 
+6) three bools to tell whether or not we're waiting on the ouput buffer, we recieved an EOF, or we sent an EOF.
+--------------------------------------------------------
+Code Description:
+
+rel_recvpkt():
+
+If packet passed length & checksum checks:
+  If packet is ACK:
+    If it's ack'ing the last packet we sent:
+      If the last packet that was just ack'ed was an EOF:
+        Call close_conn_if_possible().
+      Else: 
+	Read from input.
+    Else: 
+      Drop packet (return).
+  Else: (i.e. it's a data packet)
+    If its sequence number is equal to the last received sequence number:
+      Resend ACK (since the previous ack might've been dropped/corrupted/delayed.
+    Else if it's not exactly the next expected packet:
+      Drop packet.
+    Else (i.e. it's the next expected packet):
+      If there's no packet buffered (i.e. waiting for conn_ouput()):
+        Call rel_ouput().
+
+----------------
+rel_read():
+
+If the last packet hasn't been ack'ed yet:
+  Return.
+If no input data:
+  Return.
+If we read EOF
+  Send packet.
+  Call close_conn_if_possible.
+Else 
+  Just send packet.
+
+-----------------
+rel_ouput():
+
+If a packet is still buffered:
+  Return
+If there's not enough space in the ouput buffer:
+  Return
+If we've already received an EOF
+  Return
+If this is the first EOF we receive
+  Set the corresponding bool in rel_t struct.
+
+Output the data.
+Call close_conn_if_possible().
+
+-----------------
+
+** The rest of the functions are fairly simple to follow.
+** Note that close_conn_if_possible() only closes the connection if the following 4 conditions mentioned in the lab description are met:
+  1) You have read an EOF from the other side (i.e., a Data packet of len 12, where the payload field is 0 bytes).
+  2) You have read an EOF or error from your input (conn_input returned -1).
+  3) All packets you have sent have been acknowledged.
+  4) You have written all output data with conn_output.
+So it gets called whenever one of these is met.
+
+
+
