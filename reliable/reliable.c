@@ -24,7 +24,8 @@
 
 struct packets {
   struct packets* next;
-  int in_use;		/* True (1) if it's buffering a packet. */
+  int in_use;		/* True (i.e. 1) if it's buffering a packet. */
+  int last_retransmit;  /* Only used in send_pkts. */
   packet_t packet;
 };
 
@@ -38,21 +39,20 @@ struct reliable_state {
   struct config_common cc;
   struct sockaddr_storage sock;
   
-  int last_retransmit;		/* Last time packet was retransmitted or sent for the
-				   first time.*/
   uint32_t last_acked;		/* Last acked packet (by other side). */
   uint32_t last_seqno;   	/* Last used sequence number (by me). */
   uint32_t last_recvd_pkt;	/* Last received packet seqno. */
-  packet_t outstanding_pkt;	/* Outstanding packet (counldn't output it). */ 
-  int waiting_to_output;	/* 1 if a packet is waiting for conn_output(). 
-				   0 otherwise. */
-  packet_t last_sent_pkt;	/* Last data packet we sent. */
+  int pending_eof;		/* 1 if there's a partial packet in-flight, a pending 
+				   partial packet, and we've received EOF from 
+				   conn_input(). */
   int sent_eof;
   int received_eof;
-  //int send_window_size;
-  int pkts_buffered;
-  int partial_in_flight;
-  //packet_t packets[send_window_size];
+  uint32_t partial_in_flight;   /* 0 if no partial packet in flight. Otherwise, 
+                                   its value will be the seqno of partial packet. */
+  int partial_pending;     	/* 0 if no partial packet is waiting for another partial
+				   to be acked. 1 otherwise. */
+  packet_t pending_partial_pkt; /* Used when we read a partial packet while another
+				   partial is in-flight.*/
   struct packets* received_pkts;
   struct packets* sent_pkts;
 };
@@ -65,6 +65,9 @@ void send_ack_packet(rel_t* r, int ackno);
 void send_data_packet(rel_t* r, char* buf, int len, int seqno);
 void close_conn_if_possible(rel_t* r);
 void allocate_packets_buffer(struct packets** pkts, int window);
+void add_to_buffer(struct packets* pkts, packet_t* pkt, int window);
+void update_retransmit(struct packets* p);
+void free_buffer(struct packets* p, int window);
  
 /* Creates a new reliable protocol session, returns NULL on failure.
  * Exactly one of c and ss should be NULL.  (ss is NULL when called
@@ -95,47 +98,62 @@ rel_create (conn_t *c, const struct sockaddr_storage *ss,
   rel_list = r;
 
   /* Do any other initialization you need here */
+  if (ss != NULL) {
+    memcpy(&(r->sock), ss, sizeof(struct sockaddr_storage));
+  }
   memcpy(&(r->cc), cc, sizeof(struct config_common));
   r->last_acked = 0x00000000;
   r->last_seqno = 0x00000000;
-  r->last_recvd_pkt = 0x000000;
+  r->last_recvd_pkt = 0x00000000;
   r->sent_eof = false;
   r->received_eof = false; 
-  r->waiting_to_output = false;  
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  r->last_retransmit = ts.tv_sec*1000;
+  r->pending_eof = false;
   r->partial_in_flight = false;
-  r->pkts_buffered = 0;
+  r->partial_pending = false;
   allocate_packets_buffer(&(r->received_pkts), cc->window);
   allocate_packets_buffer(&(r->sent_pkts), cc->window);
   return r;
 }
 
+/* Allocates memory for received_pkts & sent_pkts in rel_t. */
 void
 allocate_packets_buffer(struct packets** pkts, int window) {
   int i;
   *pkts = (struct packets*) malloc(sizeof(struct packets));
   (*pkts)->next = NULL;
   (*pkts)->in_use = false;
-  struct packets* p = (*pkts)->next;   
+  struct packets* p = *pkts;   
   for (i = 1; i < window; i++) {
-    p = (struct packets*) malloc(sizeof(struct packets));
-    p->next = NULL;
-    p->in_use = false;
+    p->next = (struct packets*) malloc(sizeof(struct packets));
     p = p->next;
+    p->in_use = false;
+    p->next = NULL;
   }
 }
 
 void
+free_buffer(struct packets* p, int window) {
+  int i;
+  struct packets* next = p;
+  for (i = 0; i < window; i++) {
+    next = p->next;
+    free(p);
+    p = next;
+  }
+} 
+
+void
 rel_destroy (rel_t *r)
 {
+  printf("CALLED REL_DESTROY!!!!!!!!!!!!!\n");
   if (r->next)
     r->next->prev = r->prev;
   *r->prev = r->next;
   conn_destroy (r->c);
 
   /* Free any other allocated memory here */
+  free_buffer(r->received_pkts, r->cc.window);
+  free_buffer(r->sent_pkts, r->cc.window);
   free(r);
 }
 
@@ -153,27 +171,31 @@ rel_demux (const struct config_common *cc,
 	   const struct sockaddr_storage *ss,
 	   packet_t *pkt, size_t len)
 {
-  rel_t* r = NULL;
   if (!length_verified(pkt, len)) {
     return;
   }
   if (!checksum_verified(pkt, len)) {
     return;
   }
+  rel_t* r = NULL;
   if (!sockaddr_exists(ss, &r)) {
-    if (pkt->seqno == 1) {
+    if (ntohl(pkt->seqno) == 1) {
+      //printf("In rel_demux. sockaddr doesn't exist\n");
       r = rel_create(NULL, ss, cc);
     } else { 
+      //printf("In rel_demux. sockaddr doesn't exist & seqno != 1!\n");
       // First packet might've been dropped --> don't buffer until 
       // it's received.
       return; 
     }
   }
-  // Note: If sockadd_rexists() returns true --> r will point to the 
+  // Note: If sockaddr_exists() returns true --> r will point to the 
   // matching rel_t struct.  
+  //fprintf(stderr, "In rel_demux. Calling rel_recvpkt.\n");
   rel_recvpkt(r, pkt, len);
 }
 
+/* Returns true if sockaddr_storage already exists in rel_list. */
 int
 sockaddr_exists(const struct sockaddr_storage* ss, rel_t** match) {
   rel_t* r = rel_list;
@@ -181,6 +203,7 @@ sockaddr_exists(const struct sockaddr_storage* ss, rel_t** match) {
     struct sockaddr_storage* r_ss = &(r->sock);
     if (addreq(r_ss, ss)) { 
       *match = r;
+      //printf("In sockaddr_exists. Found match!\n");
       return true;
     }  
     r = r->next;
@@ -188,12 +211,12 @@ sockaddr_exists(const struct sockaddr_storage* ss, rel_t** match) {
   return false;
 }
 
-/* Clears all packet with sequnece number <= seqno. */
+/* Clears all packets (i.e. sets in_use to false) with sequnece number <= seqno. */
 void clear_buffer_space(struct packets* pkts, int window, uint32_t seqno) {
   int i;
   for (i = 0; i < window; i++) {
-    packet_t* packet = pkts->packet;
-    if (pkts->in_use && packet->seqno <= seqno) {
+    packet_t* packet = &(pkts->packet);
+    if (pkts->in_use && ntohl(packet->seqno) <= seqno) {
       pkts->in_use = false;
     }
     pkts = pkts->next;
@@ -203,13 +226,25 @@ void clear_buffer_space(struct packets* pkts, int window, uint32_t seqno) {
 void
 rel_recvpkt (rel_t *r, packet_t *pkt, size_t n)
 {
+  /* Still need to check length and checksum in case we're not running in server
+     mode (i.e. rel_demux() isn't being called. */
+  if (!length_verified(pkt, n)) {
+    return;
+  }
+  if (!checksum_verified(pkt, n)) {
+    return;
+  }
 
   if (ntohs(pkt->len) == ACK_PKT_LEN) {
     int diff = ntohl(pkt->ackno) - r->last_acked - 1; 
-    if (diff > 0 && <= r->cc->window) {
-      r->last_acked = ntohl(pk->akno)-1;
-      clear_buffer_space(r->received_pkts, r->cc->window, r->last_acked);
-      if (r->sent_eof) { // This is ack'ing the EOF we sent --> check if we can close.
+    //fprintf(stderr, "In rel_recvpkt. Received ACK. diff: %d\n", diff);
+    if (diff >= 0 && diff <= r->cc.window) {
+      r->last_acked = ntohl(pkt->ackno)-1;
+      if (r->last_acked >= r->partial_in_flight) {
+	r->partial_in_flight = false;
+      }
+      clear_buffer_space(r->sent_pkts, r->cc.window, r->last_acked);
+      if (r->sent_eof) { // Might be ack'ing the EOF we sent --> check if we can close.
         close_conn_if_possible(r);
         return;
       }
@@ -222,122 +257,201 @@ rel_recvpkt (rel_t *r, packet_t *pkt, size_t n)
 
   /* Since it passed the length check & isn't an ack packet 
      --> it's a data packet */
-  
-  /* If it's the last received packet --> ack might've been corrupted or lost
-     --> resend ack. */
+  //fprintf(stderr, "In rel_recvpkt. last_rcvd = %x. last_sent = %x, last_acked  = %x\n",
+  //	  r->last_recvd_pkt, r->last_seqno, r->last_acked);
   uint32_t pkt_seqno = ntohl(pkt->seqno);
   if (pkt_seqno <= r->last_recvd_pkt) {
-    send_ack_packet(r, pkt_seqno+1);
+    /* If it's the last received packet --> ack might've been corrupted or lost
+       --> resend ack. */
+    send_ack_packet(r, r->last_recvd_pkt+1);
     return;
   } else if (pkt_seqno > r->last_recvd_pkt 
-	     && pkt_seqno <= r->last_recvd_pkt+r->cc->window) {
-    add_to_buffer(r->received_pkts, pkt);
-    rel_ouput(r);
-  }
- 
-  if (!(r->waiting_to_output)) { 
-    /* Only ouput if there's no previous packet waiting (i.e. conform to window=1. */
-    r->waiting_to_output = true;
-    memcpy(&(r->outstanding_pkt), pkt, ntohs(pkt->len));
+	     && pkt_seqno <= r->last_recvd_pkt+r->cc.window) { 
+    //fprintf(stderr, "In rel_recvpkt. Adding to buffer\n");
+    add_to_buffer(r->received_pkts, pkt, r->cc.window);
     rel_output(r);
   }
 } 
 
 void
-add_to_buffer(struct pakcets* pkts, packet_t* pkt) {
+update_retransmit(struct packets* p) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  p->last_retransmit = ts.tv_sec * 1000;
+}
+
+/* First checks that the packet is not alread in the buffer. If not, it adds it. */
+void
+add_to_buffer(struct packets* pkts, packet_t* pkt, int window) {
   int i;
+  struct packets* p = pkts;
+  //fprintf(stderr, "In add_to_buffer. pkt-to-be-added-seqno: %x\n", ntohl(pkt->seqno));
   for (i = 0; i < window; i++) {
-    
+    //fprintf(stderr, "in_use: %d. seqno: %x.\n", p->in_use, ntohl(p->packet.seqno));
+    if (ntohl(p->packet.seqno) == ntohl(pkt->seqno)) {
+      update_retransmit(p);
+      if (!p->in_use) {
+	//printf("In add_to_buffer. Packet not is_use when it should!!!\n");
+        //printf("In add_to_buffer. in_use: %d\n", p->in_use);
+      }
+      return;
+    }
+    p = p->next;
   }
+  p = pkts;
+  //printf("In add_to_buffer. Before first for-loop. p: %p\n", p);
+  for (i = 0; i < window; i++) {
+    if (!p->in_use) {
+      //printf("In add_to_buffer. Adding new packet. \n");
+      memcpy(&(p->packet), pkt, MAX_PKT_LEN);
+      p->in_use = true;
+      update_retransmit(p);
+      return;
+    }
+    p = p->next;
+  }
+  //fprintf(stderr, "In add_to_buffer. SHOULDN'T GET HERE\n");
 }
 
 void
 rel_read (rel_t *s)
 {
-  if (s->last_acked < s->last_seqno) {
-    return;
-  }
-  
-  char buf[MAX_DATA];
-  int bytes_recvd = conn_input(s->c, buf, MAX_DATA);
-  
-  if (bytes_recvd == 0) { // No input to read.
-    return;
-  } 
-  if (bytes_recvd == -1) {
-    send_data_packet(s, buf, 0, s->last_seqno+1);
-    s->last_seqno++;
-    s->sent_eof = true;
-    close_conn_if_possible(s);
-    return;
-  }
-  send_data_packet(s, buf, bytes_recvd, s->last_seqno+1);
-  s->last_seqno++;
+  int num_packets_to_send = s->cc.window-(s->last_seqno - s->last_acked);
+  /* If we have space in window --> send packet. */
+  if (s->last_seqno - s->last_acked < s->cc.window) {
+    int i;
+    for (i = 0; i < num_packets_to_send; i++) {
+      char buf[MAX_DATA];
+      int bytes_read = conn_input(s->c, buf, MAX_DATA);
+      if (bytes_read == -1) {
+	if (s->partial_pending) {
+	  /* If partial pending --> send after pending partial is sent. */
+	  s->pending_eof = true;
+	  return; 
+	} else {
+	  /* Send EOF. It's ok if there's a partial in-flight. */
+	  send_data_packet(s, buf, 0, s->last_seqno+1);
+	  s->last_seqno++;
+          s->sent_eof = true;
+          close_conn_if_possible(s);
+          return;
+	}
+      } else if (bytes_read > 0) {
+	if (s->partial_pending) {
+	  /* If partial pending --> fill partial first. */
+	  packet_t* pkt = &(s->pending_partial_pkt);
+	  int bytes_available = MAX_PKT_LEN - ntohs(pkt->len);
+	  int writing_index = MAX_DATA - bytes_available;
+          if (bytes_read < bytes_available) {
+	    /* Partial won't be full --> fill bytes & return. */
+	    memcpy(pkt->data+writing_index, buf, bytes_read);
+	    pkt->len = htons(ntohs(pkt->len)+bytes_read);
+	    return; // No need to read more since we didn't fill buf.
+	  } else {
+	    /* Case when partial will be full --> send full packet & create new 
+	       partial if there's remaining data. */
+	    memcpy(pkt->data+writing_index, buf, bytes_available);
+	    pkt->len = htons(ntohs(pkt->len)+bytes_available);
+	    int remaining_bytes = bytes_read - bytes_available;
+	    send_data_packet(s, pkt->data, MAX_DATA, ntohl(pkt->seqno)); 
+	    s->partial_pending = false;
+	    if (remaining_bytes > 0) {
+	      /* Create another partial for remaining data. */
+	      memcpy(pkt->data, buf+bytes_available, remaining_bytes);
+	      pkt->seqno = htonl(s->last_seqno+1);
+	      pkt->len = htons(MIN_DATA_PKT_LEN + remaining_bytes);
+	      s->partial_pending = true;
+	      s->last_seqno++;
+	    }
+	  }
+        } else {
+	  /* Case when no partial is pending. A partial could still be in-flight. */
+	  packet_t pkt;
+	  memcpy(pkt.data, buf, bytes_read);
+	  pkt.len = htons(MIN_DATA_PKT_LEN + bytes_read);
+	  pkt.seqno = htonl(s->last_seqno+1);
+	  s->last_seqno++;
+	  send_data_packet(s, pkt.data, bytes_read, ntohl(pkt.seqno));
+	  if (bytes_read < MAX_DATA) {
+  	    /* Case: Partial packet --> send packet & return. */
+	    s->partial_in_flight = ntohl(pkt.seqno);
+	    return; // No need to read more since we just read a partial.  
+	  }
+	}
+      } // End of: else if (bytes_read > 0  
+    } // End of: for-loop.
+  } // End of: if (s->last_seqno - s->last_acked > windnow)           
 }
 
 void
 rel_output (rel_t *r)
 {
-  packet_t* packet = &(r->outstanding_pkt);
-  if (!(r->waiting_to_output)) { // A packet is still buffered.
+  if (r->received_eof) {
     return;
   }
-  if (conn_bufspace(r->c) <= ntohs(packet->len)) {
-    return;
+  struct packets* p;;
+  int i;
+  for (i = 0; i < r->cc.window; i++) {
+    p = r->received_pkts;
+    int j;
+    for (j = 0; j < r->cc.window; j++) {
+      if (p->in_use && ntohl(p->packet.seqno) - r->last_recvd_pkt == 1) {
+	packet_t* packet = &(p->packet);
+	if (conn_bufspace(r->c) > ntohs(packet->len)) {
+//	  fprintf(stderr, "In rel_output. Calling conn_output\n");
+	  conn_output(r->c, packet->data, ntohs(packet->len)-MIN_DATA_PKT_LEN);
+	  send_ack_packet(r, ntohl(packet->seqno)+1);
+	  r->last_recvd_pkt++;
+	  p->in_use = false; 
+	  if (ntohs(packet->len) == MIN_DATA_PKT_LEN) {
+	    /* Case: this is an EOF packet. */
+	    r->received_eof = true;
+	    close_conn_if_possible(r);
+	  }
+	  //break;
+	} else { /* Case: No space in output buffer --> return. */
+	  return;
+	}
+      }
+      p = p->next;
+    }
   }
-  if (r->received_eof) { 
-    return;
-  }    
-  
-  /* We're good to output data: */
-
-  int data_size = ntohs(packet->len) - MIN_DATA_PKT_LEN;
-  
-  if (data_size == 0) {
-    r->received_eof = true;
-  }
- 
-  conn_output(r->c, packet->data,  data_size);
-  
-  r->last_recvd_pkt = ntohl(packet->seqno);
-  send_ack_packet(r, ntohl(packet->seqno)+1);
-  r->waiting_to_output = false;
-  close_conn_if_possible(r);
 }
 
 void
 rel_timer ()
-{
+{ 
   /* Retransmit any packets that need to be retransmitted */
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   int current_time = ts.tv_sec*1000; // in milliseconds/
-  rel_t* r = rel_list;
+  rel_t* s = rel_list;
   
-  while (r != NULL) {
+  while (s != NULL) {
     // Only retransmit when no ack received and we timed out.
-    if (r->last_acked < r->last_seqno 
-        && current_time - r->last_retransmit >= r->cc.timeout) {
-      packet_t* packet = &(r->last_sent_pkt);
-      send_data_packet(r, packet->data, ntohs(packet->len)-MIN_DATA_PKT_LEN, 
-  	  	       ntohl(packet->seqno));
-      r->last_retransmit = current_time;
-    }
-    close_conn_if_possible(rel_list);
-    r = r->next; 
+    int window = s->cc.window;
+    int i;
+    struct packets* p = s->sent_pkts;
+    for (i = 0; i < window; i++) {
+      packet_t* packet = &(p->packet);
+      if (p->in_use && ntohl(packet->seqno) > s->last_acked
+	  && current_time - p->last_retransmit >= s->cc.timeout) {
+	send_data_packet(s, packet->data, ntohs(packet->len)-MIN_DATA_PKT_LEN,
+			 ntohl(packet->seqno));
+      }
+      p = p->next;
+    }  
+    s = s->next; 
   }
 }
 
 void
 close_conn_if_possible(rel_t* r) {
   int close = true;
-  if (!r->received_eof) {
+  if (!r->received_eof) {      
     close = false;
   }
   if (!r->sent_eof) {
-    close = false;
-  }
-  if (r->waiting_to_output) {
     close = false;
   }
   if (r->last_acked != r->last_seqno) {
@@ -361,18 +475,13 @@ send_data_packet(rel_t* s, char* buf, int len, int seqno) {
   computed_cksum  = cksum(&packet, packet_len);
   packet.cksum = computed_cksum;
   conn_sendpkt(s->c, &packet, packet_len);
-  memcpy(&(s->last_sent_pkt), &packet, packet_len);
-  
-  // Update last retransmi
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  s->last_retransmit = ts.tv_sec * 1000; 
+  add_to_buffer(s->sent_pkts, &packet, s->cc.window); 
 }
 
 
 void
 send_ack_packet(rel_t* r, int ackno) {
-  //packet_t* packet = r->outstanding_pkt;
+  //fprintf(stderr, "In send_ack_packet. ackno: %x\n", ackno);
   packet_t ack_pkt;
   ack_pkt.cksum = 0x0000;
   ack_pkt.cksum = 0x00000000;
@@ -381,7 +490,7 @@ send_ack_packet(rel_t* r, int ackno) {
   uint16_t computed_cksum = cksum(&ack_pkt, ACK_PKT_LEN);
   ack_pkt.cksum = computed_cksum;
   conn_sendpkt(r->c, &ack_pkt, ACK_PKT_LEN);
-  //print_pkt(&ack_pkt, "ack", ntohs(ack_pkt.len));
+  print_pkt(&ack_pkt, "ack", ntohs(ack_pkt.len));
 }
 
 

@@ -244,6 +244,7 @@ conn_bufspace (conn_t *c)
   size_t used = 0;
   const size_t bufsize = 8192;
 
+
   for (ch = c->outq; ch; ch = ch->next)
     used += (ch->size - ch->used);
   return used > bufsize ? 0 : bufsize - used;
@@ -254,7 +255,7 @@ conn_output (conn_t *c, const void *_buf, size_t _n)
 {
   const char *buf = _buf;
   int n = _n;
-  
+
   assert (!c->delete_me && !c->write_eof);
 
   if (n == 0) {
@@ -539,7 +540,6 @@ conn_mkevents (void)
 static void
 conn_demux (const struct config_server *cs)
 {
-  printf("In conn_demux().\n");
   packet_t pkt;
   struct sockaddr_storage ss;
   int n;
@@ -955,15 +955,13 @@ do_client (struct config_client *cc)
 void
 do_server (struct config_server *cs)
 {
-  printf("In do_server()\n");
   serverconf = cs;
   conn_mkevents ();
   make_async (cs->udp_socket);
   cevents[0].fd = cs->udp_socket;
   cevents[0].events = POLLIN;
-  for (;;) {;
+  for (;;) {
     conn_poll (&cs->c);
-    printf("passed conn_poll\n");
     if (cevents[0].revents)
       conn_demux (cs);
   }
@@ -1056,7 +1054,7 @@ main (int argc, char **argv)
 	  perror (name);
       }
       break;
-    case 'k':
+    case 'u':
       opt_unix = 1;
       break;
     case 's':
