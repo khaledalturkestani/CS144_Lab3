@@ -58,6 +58,7 @@ struct reliable_state {
 };
 rel_t *rel_list;
 
+void clear_buffer_space(struct packets* pkts, int window, uint32_t seqno); 
 int sockaddr_exists(const struct sockaddr_storage* ss, rel_t** match); 
 int length_verified(packet_t* packet, size_t recvd_len);
 int checksum_verified(packet_t* packet, size_t recvd_len);
@@ -115,37 +116,9 @@ rel_create (conn_t *c, const struct sockaddr_storage *ss,
   return r;
 }
 
-/* Allocates memory for received_pkts & sent_pkts in rel_t. */
-void
-allocate_packets_buffer(struct packets** pkts, int window) {
-  int i;
-  *pkts = (struct packets*) malloc(sizeof(struct packets));
-  (*pkts)->next = NULL;
-  (*pkts)->in_use = false;
-  struct packets* p = *pkts;   
-  for (i = 1; i < window; i++) {
-    p->next = (struct packets*) malloc(sizeof(struct packets));
-    p = p->next;
-    p->in_use = false;
-    p->next = NULL;
-  }
-}
-
-void
-free_buffer(struct packets* p, int window) {
-  int i;
-  struct packets* next = p;
-  for (i = 0; i < window; i++) {
-    next = p->next;
-    free(p);
-    p = next;
-  }
-} 
-
 void
 rel_destroy (rel_t *r)
 {
-  printf("CALLED REL_DESTROY!!!!!!!!!!!!!\n");
   if (r->next)
     r->next->prev = r->prev;
   *r->prev = r->next;
@@ -180,10 +153,8 @@ rel_demux (const struct config_common *cc,
   rel_t* r = NULL;
   if (!sockaddr_exists(ss, &r)) {
     if (ntohl(pkt->seqno) == 1) {
-      //printf("In rel_demux. sockaddr doesn't exist\n");
       r = rel_create(NULL, ss, cc);
     } else { 
-      //printf("In rel_demux. sockaddr doesn't exist & seqno != 1!\n");
       // First packet might've been dropped --> don't buffer until 
       // it's received.
       return; 
@@ -191,36 +162,7 @@ rel_demux (const struct config_common *cc,
   }
   // Note: If sockaddr_exists() returns true --> r will point to the 
   // matching rel_t struct.  
-  //fprintf(stderr, "In rel_demux. Calling rel_recvpkt.\n");
   rel_recvpkt(r, pkt, len);
-}
-
-/* Returns true if sockaddr_storage already exists in rel_list. */
-int
-sockaddr_exists(const struct sockaddr_storage* ss, rel_t** match) {
-  rel_t* r = rel_list;
-  while (r != NULL) {
-    struct sockaddr_storage* r_ss = &(r->sock);
-    if (addreq(r_ss, ss)) { 
-      *match = r;
-      //printf("In sockaddr_exists. Found match!\n");
-      return true;
-    }  
-    r = r->next;
-  }
-  return false;
-}
-
-/* Clears all packets (i.e. sets in_use to false) with sequnece number <= seqno. */
-void clear_buffer_space(struct packets* pkts, int window, uint32_t seqno) {
-  int i;
-  for (i = 0; i < window; i++) {
-    packet_t* packet = &(pkts->packet);
-    if (pkts->in_use && ntohl(packet->seqno) <= seqno) {
-      pkts->in_use = false;
-    }
-    pkts = pkts->next;
-  }
 }
 
 void
@@ -237,12 +179,22 @@ rel_recvpkt (rel_t *r, packet_t *pkt, size_t n)
 
   if (ntohs(pkt->len) == ACK_PKT_LEN) {
     int diff = ntohl(pkt->ackno) - r->last_acked - 1; 
-    //fprintf(stderr, "In rel_recvpkt. Received ACK. diff: %d\n", diff);
     if (diff >= 0 && diff <= r->cc.window) {
       r->last_acked = ntohl(pkt->ackno)-1;
       if (r->last_acked >= r->partial_in_flight) {
 	r->partial_in_flight = false;
-      }
+ /*       if (r->partial_pending && r->pending_eof) {
+	  send_data_packet(r, r->pending_partial_pkt.data, 
+			   ntohs(r->pending_partial_pkt.len)-MIN_DATA_PKT_LEN, 
+			   ntohl(r->pending_partial_pkt.seqno));
+	  char buf[MAX_DATA]; // Dummy buffer
+	  send_data_packet(r, buf, 0, r->last_seqno++);
+	  r->last_seqno++;
+	  r->pending_eof = false;
+	  r->sent_eof = true;
+	  r->partial_pending = false;
+	}*/
+      } 
       clear_buffer_space(r->sent_pkts, r->cc.window, r->last_acked);
       if (r->sent_eof) { // Might be ack'ing the EOF we sent --> check if we can close.
         close_conn_if_possible(r);
@@ -257,8 +209,6 @@ rel_recvpkt (rel_t *r, packet_t *pkt, size_t n)
 
   /* Since it passed the length check & isn't an ack packet 
      --> it's a data packet */
-  //fprintf(stderr, "In rel_recvpkt. last_rcvd = %x. last_sent = %x, last_acked  = %x\n",
-  //	  r->last_recvd_pkt, r->last_seqno, r->last_acked);
   uint32_t pkt_seqno = ntohl(pkt->seqno);
   if (pkt_seqno <= r->last_recvd_pkt) {
     /* If it's the last received packet --> ack might've been corrupted or lost
@@ -267,51 +217,10 @@ rel_recvpkt (rel_t *r, packet_t *pkt, size_t n)
     return;
   } else if (pkt_seqno > r->last_recvd_pkt 
 	     && pkt_seqno <= r->last_recvd_pkt+r->cc.window) { 
-    //fprintf(stderr, "In rel_recvpkt. Adding to buffer\n");
     add_to_buffer(r->received_pkts, pkt, r->cc.window);
     rel_output(r);
   }
 } 
-
-void
-update_retransmit(struct packets* p) {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  p->last_retransmit = ts.tv_sec * 1000;
-}
-
-/* First checks that the packet is not alread in the buffer. If not, it adds it. */
-void
-add_to_buffer(struct packets* pkts, packet_t* pkt, int window) {
-  int i;
-  struct packets* p = pkts;
-  //fprintf(stderr, "In add_to_buffer. pkt-to-be-added-seqno: %x\n", ntohl(pkt->seqno));
-  for (i = 0; i < window; i++) {
-    //fprintf(stderr, "in_use: %d. seqno: %x.\n", p->in_use, ntohl(p->packet.seqno));
-    if (ntohl(p->packet.seqno) == ntohl(pkt->seqno)) {
-      update_retransmit(p);
-      if (!p->in_use) {
-	//printf("In add_to_buffer. Packet not is_use when it should!!!\n");
-        //printf("In add_to_buffer. in_use: %d\n", p->in_use);
-      }
-      return;
-    }
-    p = p->next;
-  }
-  p = pkts;
-  //printf("In add_to_buffer. Before first for-loop. p: %p\n", p);
-  for (i = 0; i < window; i++) {
-    if (!p->in_use) {
-      //printf("In add_to_buffer. Adding new packet. \n");
-      memcpy(&(p->packet), pkt, MAX_PKT_LEN);
-      p->in_use = true;
-      update_retransmit(p);
-      return;
-    }
-    p = p->next;
-  }
-  //fprintf(stderr, "In add_to_buffer. SHOULDN'T GET HERE\n");
-}
 
 void
 rel_read (rel_t *s)
@@ -362,7 +271,7 @@ rel_read (rel_t *s)
 	      pkt->len = htons(MIN_DATA_PKT_LEN + remaining_bytes);
 	      s->partial_pending = true;
 	      s->last_seqno++;
-	    }
+	    } 
 	  }
         } else {
 	  /* Case when no partial is pending. A partial could still be in-flight. */
@@ -398,7 +307,6 @@ rel_output (rel_t *r)
       if (p->in_use && ntohl(p->packet.seqno) - r->last_recvd_pkt == 1) {
 	packet_t* packet = &(p->packet);
 	if (conn_bufspace(r->c) > ntohs(packet->len)) {
-//	  fprintf(stderr, "In rel_output. Calling conn_output\n");
 	  conn_output(r->c, packet->data, ntohs(packet->len)-MIN_DATA_PKT_LEN);
 	  send_ack_packet(r, ntohl(packet->seqno)+1);
 	  r->last_recvd_pkt++;
@@ -445,6 +353,95 @@ rel_timer ()
   }
 }
 
+/* Sets the last retransmit time for a packet to current time. */
+void
+update_retransmit(struct packets* p) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  p->last_retransmit = ts.tv_sec * 1000;
+}
+
+/* First checks that the packet is not alread in the buffer. If not, it adds it. */
+void
+add_to_buffer(struct packets* pkts, packet_t* pkt, int window) {
+  int i;
+  struct packets* p = pkts;
+  for (i = 0; i < window; i++) {
+    if (ntohl(p->packet.seqno) == ntohl(pkt->seqno)) {
+      update_retransmit(p);
+      return;
+    }
+    p = p->next;
+  }
+  p = pkts;
+  for (i = 0; i < window; i++) {
+    if (!p->in_use) {
+      memcpy(&(p->packet), pkt, MAX_PKT_LEN);
+      p->in_use = true;
+      update_retransmit(p);
+      return;
+    }
+    p = p->next;
+  }
+}
+
+/* Allocates memory for received_pkts & sent_pkts in rel_t. */
+void
+allocate_packets_buffer(struct packets** pkts, int window) {
+  int i;
+  *pkts = (struct packets*) malloc(sizeof(struct packets));
+  (*pkts)->next = NULL;
+  (*pkts)->in_use = false;
+  struct packets* p = *pkts;   
+  for (i = 1; i < window; i++) {
+    p->next = (struct packets*) malloc(sizeof(struct packets));
+    p = p->next;
+    p->in_use = false;
+    p->next = NULL;
+  }
+}
+
+/* Free memory allocated to received_pkts & sent_pkts in rel_t. */
+void
+free_buffer(struct packets* p, int window) {
+  int i;
+  struct packets* next = p;
+  for (i = 0; i < window; i++) {
+    next = p->next;
+    free(p);
+    p = next;
+  }
+} 
+
+/* Returns true if sockaddr_storage already exists in rel_list. */
+int
+sockaddr_exists(const struct sockaddr_storage* ss, rel_t** match) {
+  rel_t* r = rel_list;
+  while (r != NULL) {
+    struct sockaddr_storage* r_ss = &(r->sock);
+    if (addreq(r_ss, ss)) { 
+      *match = r;
+      return true;
+    }  
+    r = r->next;
+  }
+  return false;
+}
+
+/* Clears all packets (i.e. sets in_use to false) with sequnece number <= seqno. */
+void clear_buffer_space(struct packets* pkts, int window, uint32_t seqno) {
+  int i;
+  for (i = 0; i < window; i++) {
+    packet_t* packet = &(pkts->packet);
+    if (pkts->in_use && ntohl(packet->seqno) <= seqno) {
+      pkts->in_use = false;
+    }
+    pkts = pkts->next;
+  }
+}
+
+
+
 void
 close_conn_if_possible(rel_t* r) {
   int close = true;
@@ -481,7 +478,6 @@ send_data_packet(rel_t* s, char* buf, int len, int seqno) {
 
 void
 send_ack_packet(rel_t* r, int ackno) {
-  //fprintf(stderr, "In send_ack_packet. ackno: %x\n", ackno);
   packet_t ack_pkt;
   ack_pkt.cksum = 0x0000;
   ack_pkt.cksum = 0x00000000;
@@ -515,11 +511,9 @@ length_verified(packet_t* packet, size_t recvd_len) {
 int
 checksum_verified(packet_t* packet, size_t recvd_len) {
   uint16_t recvd_cksum = packet->cksum;
-  //printf("recvd_cksum: %04x\n", recvd_cksum);
   packet->cksum = 0x0000;
   uint16_t computed_cksum = cksum(packet, ntohs(packet->len));
   packet->cksum = recvd_cksum;
-  //printf("recvd_cksum: %04x, computed_cksum: %04x\n", recvd_cksum, computed_cksum);
   return recvd_cksum == computed_cksum;
 }
 

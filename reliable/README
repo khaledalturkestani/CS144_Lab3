@@ -1,65 +1,79 @@
-** Please note that since we're assuming a window of size 1, a lot of my desing choices
-were chosen accordingly, and I will need to modify some of those choices for lab 3. 
  
 rel_t:
 
 rel_t keeps track of 
-1) the last sent packet, 
-2) the last acked packet, 
-3) the last received packet (all three by keeping track of the corresponding sequence numbers),
-4) a copy of the last received packet (in case we're buffering it),
-5) the last time we (re)transmitted a data packet, and 
-6) three bools to tell whether or not we're waiting on the ouput buffer, we recieved an EOF, or we sent an EOF.
+1) the last sent packet's sequence number, 
+2) the last acked packet's sequence number, 
+4) the buffer of size window that stores received packets,
+5) the buffer of size window that stores sent packet, 
+6) four bools that tell us whether a partial packet is pending, an EOF is waiting to be sent, we sent and EOF, we recieved an EOF.
 --------------------------------------------------------
 Code Description:
 
+rel_demux():
+
+First, check if packet has valid length & checksum
+If sockaddr_storage is new
+  Create a new rel_t and add it to rel_list
+Else 
+  Fetch teh existing one.
+Call rel_recvpkt();
+
+----------------
 rel_recvpkt():
 
+Check length and checksum again (in case we're not in server mode)
 If packet passed length & checksum checks:
   If packet is ACK:
-    If it's ack'ing the last packet we sent:
-      If the last packet that was just ack'ed was an EOF:
-        Call close_conn_if_possible().
-      Else: 
-	Read from input.
+    If it's ack'ing one of the sent packets within our window
+      Update our last acked packet counter
+      Clear buffer from packet that was acked
+      If we've sent and EOF
+	Call close_conn_if_possible() since this ack might be for the EOF we sent.  
+      Read from input (call rel_read()).
     Else: 
       Drop packet (return).
   Else: (i.e. it's a data packet)
-    If its sequence number is equal to the last received sequence number:
+    If its sequence number is <= to the last received sequence number:
       Resend ACK (since the previous ack might've been dropped/corrupted/delayed.
-    Else if it's not exactly the next expected packet:
-      Drop packet.
-    Else (i.e. it's the next expected packet):
-      If there's no packet buffered (i.e. waiting for conn_ouput()):
-        Call rel_ouput().
+    Else if it's within our receiving window
+      Add packet to our received packets buffer
+      Call rel_output()
 
 ----------------
 rel_read():
 
-If the last packet hasn't been ack'ed yet:
-  Return.
-If no input data:
-  Return.
-If we read EOF
-  Send packet.
-  Call close_conn_if_possible.
-Else 
-  Just send packet.
+If number of packets in-flight < window
+  Try to fill remaining space in window (through for-loop)
+    Read from conn_input()
+    If EOF
+      If there's a partial pending (i.e. partial waiting on another partial that's in-flight)
+	set partial pending flag to true
+      Else 
+	Send EOF (It's ok if there's a partial in-flight)
+    Else if bytes read > 0
+      If partial pending
+	If bytes read < remaining space in partial
+	  Fill the partial and return (since we can't send it until other partial in-flight is acked)
+	Else
+	  Fill the partial and send it (since it'll be full)
+	  If there are more bytes
+	    Create another partial & return
+      Else (i.e. no partial pending)
+	Send partial 
 
 -----------------
 rel_ouput():
 
-If a packet is still buffered:
-  Return
-If there's not enough space in the ouput buffer:
-  Return
-If we've already received an EOF
-  Return
-If this is the first EOF we receive
-  Set the corresponding bool in rel_t struct.
+If already reaceived EOF
+  return
 
-Output the data.
-Call close_conn_if_possible().
+Iterate over buffer of received packet and output them in order
+  If conn_bufspace() returns smaller space 
+    return
+  If we read an EOF
+    set corresponding bool
+    call close_conn_if_possible() 
 
 -----------------
 
@@ -71,5 +85,64 @@ Call close_conn_if_possible().
   4) You have written all output data with conn_output.
 So it gets called whenever one of these is met.
 
+------------------------------------------
+
+Testing:
+
+I ran the Tester, which was very helpful, with different parameters. the -v and -d were also very helpful.
+
+-----------------------------------------
+
+Main Challenges:
+
+The main challenge for me was implementing the Nagle algorithm. Specifically, the case when we have a partial packet
+in-flight and we want to send another packet. That introduced a bunch of edge cases that I have to consider and slightly 
+complicated my case.
+
+Another challenge was iterating over the received packets buffer and outputting data in order.
+
+Also, making sure that the buffers were up to date required a bit of thought.
+
+-----------------------------------------
+valgrind output:
+
+I ran the the code on server mode and had it interact with a client.
+
+server:
+
+==8134== HEAP SUMMARY:
+==8134==     in use at exit: 48 bytes in 3 blocks
+==8134==   total heap usage: 84 allocs, 81 frees, 12,040 bytes allocated
+==8134== 
+==8134== LEAK SUMMARY:
+==8134==    definitely lost: 0 bytes in 0 blocks
+==8134==    indirectly lost: 0 bytes in 0 blocks
+==8134==      possibly lost: 0 bytes in 0 blocks
+==8134==    still reachable: 48 bytes in 3 blocks
+==8134==         suppressed: 0 bytes in 0 blocks
+==8134== Rerun with --leak-check=full to see details of leaked memory
+==8134== 
+==8134== For counts of detected and suppressed errors, rerun with: -v
+==8134== Use --track-origins=yes to see where uninitialised values come from
+==8134== ERROR SUMMARY: 2 errors from 2 contexts (suppressed: 2 from 2)
+
+
+client:
+
+==4581== HEAP SUMMARY:
+==4581==     in use at exit: 48 bytes in 3 blocks
+==4581==   total heap usage: 87 allocs, 84 frees, 12,160 bytes allocated
+==4581== 
+==4581== LEAK SUMMARY:
+==4581==    definitely lost: 0 bytes in 0 blocks
+==4581==    indirectly lost: 0 bytes in 0 blocks
+==4581==      possibly lost: 0 bytes in 0 blocks
+==4581==    still reachable: 48 bytes in 3 blocks
+==4581==         suppressed: 0 bytes in 0 blocks
+==4581== Rerun with --leak-check=full to see details of leaked memory
+==4581== 
+==4581== For counts of detected and suppressed errors, rerun with: -v
+==4581== Use --track-origins=yes to see where uninitialised values come from
+==4581== ERROR SUMMARY: 5 errors from 5 contexts (suppressed: 2 from 2)
 
 
